@@ -10,6 +10,7 @@ Without arguments a small window opens. With arguments the tool stays a CLI:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
@@ -32,6 +33,25 @@ USER_ERRORS = (
     NoLayoutsError,
     ValueError,
 )
+logger = logging.getLogger("dwg_layout_publisher")
+
+
+def configure_logging() -> None:
+    """Send logs, including exception tracebacks, to the terminal."""
+    root = logging.getLogger()
+    if root.handlers:
+        return
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(message)s",
+        stream=sys.stderr,
+    )
+
+
+def log_failure(exc: BaseException) -> None:
+    """Write the full traceback of a user-facing error to the log."""
+    configure_logging()
+    logger.error("%s", exc, exc_info=exc)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -85,6 +105,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     """Run the CLI, or the window when no arguments are given."""
+    configure_logging()
     args_list = list(sys.argv[1:] if argv is None else argv)
     if not args_list:
         return run_gui()
@@ -105,6 +126,7 @@ def main(argv: list[str] | None = None) -> int:
             include_model=args.include_model,
         )
     except USER_ERRORS as exc:
+        log_failure(exc)
         print(str(exc), file=sys.stderr)
         return 1
 
@@ -253,6 +275,7 @@ def run_gui() -> int:
                 doc = load_document(path)
                 self._layouts = list_layouts(doc, include_model=self.model_var.get())
             except USER_ERRORS as exc:
+                log_failure(exc)
                 self._layouts = []
                 self._fill_list()
                 self._fail(str(exc))
@@ -311,6 +334,7 @@ def run_gui() -> int:
                     include_model=include_model,
                 )
             except USER_ERRORS as exc:
+                log_failure(exc)
                 self._fail(str(exc))
                 return
             self.status_var.set(f"Klaar: {len(written)} bestand(en) in {output}.")

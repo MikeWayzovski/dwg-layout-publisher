@@ -12,6 +12,8 @@ Limitations:
 
 from __future__ import annotations
 
+import logging
+import math
 import os
 import re
 import shutil
@@ -23,6 +25,7 @@ from pathlib import Path
 from typing import Iterable, Sequence
 
 import ezdxf
+from ezdxf import bbox as ezdxf_bbox
 from ezdxf.addons.drawing import Frontend, RenderContext
 from ezdxf.addons.drawing.dxf import DXFBackend
 from ezdxf.addons.drawing.layout import Page
@@ -33,7 +36,10 @@ from ezdxf.layouts import BaseLayout, Modelspace
 from ezdxf.path import to_splines_and_polylines
 
 SUPPORTED_FORMATS = ("pdf", "dxf")
+A3_WIDTH_MM = 420.0
+A3_HEIGHT_MM = 297.0
 _INVALID_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+logger = logging.getLogger("dwg_layout_publisher")
 
 
 class Dwg2dxfNotFoundError(FileNotFoundError):
@@ -143,7 +149,7 @@ def list_layouts(doc: Drawing, *, include_model: bool = False) -> list[LayoutInf
         is_model = _is_modelspace(layout)
         if is_model and not include_model:
             continue
-        width, height = _paper_mm(layout)
+        width, height = resolve_paper_mm(layout)
         infos.append(
             LayoutInfo(
                 name=layout.name,
@@ -168,6 +174,9 @@ def export_layout_pdf(doc: Drawing, layout_name: str, dest: str | Path) -> Path:
     except OSError as exc:
         raise DxfLoadError(f"Kan PDF niet schrijven: {destination}: {exc}") from exc
     except Exception as exc:
+        logger.exception(
+            "Layout '%s' kon niet naar PDF worden geëxporteerd.", layout_name
+        )
         raise DxfLoadError(
             f"Layout '{layout_name}' kon niet naar PDF worden geëxporteerd: {exc}"
         ) from exc
@@ -191,6 +200,9 @@ def export_layout_dxf(doc: Drawing, layout_name: str, dest: str | Path) -> Path:
     except OSError as exc:
         raise DxfLoadError(f"Kan DXF niet schrijven: {destination}: {exc}") from exc
     except Exception as exc:
+        logger.exception(
+            "Layout '%s' kon niet naar DXF worden geëxporteerd.", layout_name
+        )
         raise DxfLoadError(
             f"Layout '{layout_name}' kon niet naar DXF worden geëxporteerd: {exc}"
         ) from exc
@@ -329,11 +341,78 @@ def _is_modelspace(layout: BaseLayout) -> bool:
     return isinstance(layout, Modelspace) or layout.name.upper() == "MODEL"
 
 
-def _paper_mm(layout: BaseLayout) -> tuple[float | None, float | None]:
-    width = float(layout.dxf.get("paper_width") or 0)
-    height = float(layout.dxf.get("paper_height") or 0)
-    if width <= 0 or height <= 0:
-        return None, None
+def resolve_paper_mm(layout: BaseLayout) -> tuple[float, float]:
+    """Return a usable page size in millimetres.
+
+    ``page_real_width`` / ``page_real_height`` are preferred when a converter
+    wrote them. Otherwise the DXF ``paper_width`` / ``paper_height`` values are
+    used. NaN, infinite, and non-positive sizes are invalid: the geometry
+    bounding box is tried next, and A3 (420 x 297 mm) is the last resort.
+    """
+    stored = _valid_stored_paper_mm(layout)
+    if stored is not None:
+        return stored
+    logger.warning(
+        "Layout '%s' heeft geen geldige papierafmetingen (page_real_width/"
+        "page_real_height of paper_width/paper_height). De bounding box wordt gebruikt.",
+        layout.name,
+    )
+    box = _bbox_size_mm(layout)
+    if box is not None:
+        return box
+    logger.warning(
+        "Layout '%s' heeft geen bruikbare geometrie. A3 (420 x 297 mm) wordt gebruikt.",
+        layout.name,
+    )
+    return A3_WIDTH_MM, A3_HEIGHT_MM
+
+
+def _valid_stored_paper_mm(layout: BaseLayout) -> tuple[float, float] | None:
+    real_width = _dxf_millimetres(layout, "page_real_width")
+    real_height = _dxf_millimetres(layout, "page_real_height")
+    if real_width is not None and real_height is not None:
+        return real_width, real_height
+    width = _dxf_millimetres(layout, "paper_width")
+    height = _dxf_millimetres(layout, "paper_height")
+    if width is not None and height is not None:
+        return width, height
+    return None
+
+
+def _dxf_millimetres(layout: BaseLayout, name: str) -> float | None:
+    dxf = layout.dxf
+    try:
+        if not dxf.hasattr(name):
+            return None
+        raw = dxf.get(name)
+    except Exception:
+        logger.exception("Attribuut '%s' van layout '%s' is onleesbaar.", name, layout.name)
+        return None
+    return _finite_positive(raw)
+
+
+def _finite_positive(value: object) -> float | None:
+    try:
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number) or number <= 0:
+        return None
+    return number
+
+
+def _bbox_size_mm(layout: BaseLayout) -> tuple[float, float] | None:
+    try:
+        box = ezdxf_bbox.extents(layout)
+    except Exception:
+        logger.exception("Bounding box van layout '%s' kon niet worden berekend.", layout.name)
+        return None
+    if not box.has_data:
+        return None
+    width = _finite_positive(box.size.x)
+    height = _finite_positive(box.size.y)
+    if width is None or height is None:
+        return None
     return width, height
 
 
@@ -345,16 +424,38 @@ def _get_layout(doc: Drawing, name: str) -> BaseLayout:
 
 
 def _page_for_layout(layout: BaseLayout) -> Page:
+    stored = _valid_stored_paper_mm(layout)
+    if stored is not None:
+        try:
+            page = Page.from_dxf_layout(layout)
+        except Exception:
+            logger.exception(
+                "Paginainstellingen van layout '%s' zijn onleesbaar.", layout.name
+            )
+        else:
+            if _page_is_usable(page):
+                return page
+        return Page(*stored)
+    width, height = resolve_paper_mm(layout)
+    return Page(width, height)
+
+
+def _page_is_usable(page: Page) -> bool:
+    if _finite_positive(page.width) is None or _finite_positive(page.height) is None:
+        return False
+    margins = page.margins
+    return all(
+        _finite_non_negative(value)
+        for value in (margins.top, margins.right, margins.bottom, margins.left)
+    )
+
+
+def _finite_non_negative(value: object) -> bool:
     try:
-        page = Page.from_dxf_layout(layout)
-    except Exception:
-        page = Page(0, 0)
-    if page.width > 0 and page.height > 0:
-        return page
-    width, height = _paper_mm(layout)
-    if width and height:
-        return Page(width, height)
-    return Page(0, 0)
+        number = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return math.isfinite(number) and number >= 0
 
 
 def _normalize_formats(formats: Iterable[str]) -> tuple[str, ...]:

@@ -19,7 +19,9 @@ from converter import (
     list_layouts,
     load_document,
     publish,
+    resolve_paper_mm,
 )
+from main import main
 
 
 def _write_sample(path: Path) -> None:
@@ -111,6 +113,46 @@ def test_no_paperspace_layouts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setattr("converter.list_layouts", lambda *_args, **_kwargs: [])
     with pytest.raises(NoLayoutsError, match="PaperSpace"):
         publish(source, tmp_path / "out", ["pdf"])
+
+
+def _clear_layout(layout) -> None:
+    for entity in list(layout):
+        layout.delete_entity(entity)
+
+
+def test_invalid_paper_size_uses_bounding_box(tmp_path: Path) -> None:
+    doc = ezdxf.new()
+    layout = doc.layouts.new("Meting")
+    _clear_layout(layout)
+    layout.dxf.paper_width = float("nan")
+    layout.dxf.paper_height = float("nan")
+    layout.add_line((0, 0), (200, 80))
+    source = tmp_path / "nan.dxf"
+    doc.saveas(source)
+
+    loaded = load_document(source).layouts.get("Meting")
+    assert resolve_paper_mm(loaded) == (200.0, 80.0)
+    written = publish(source, tmp_path / "out", ["pdf"], ["Meting"])
+    assert written[0].read_bytes().startswith(b"%PDF")
+
+
+def test_invalid_paper_size_without_geometry_uses_a3() -> None:
+    doc = ezdxf.new()
+    layout = doc.layouts.new("Leeg")
+    _clear_layout(layout)
+    layout.dxf.paper_width = float("nan")
+    layout.dxf.paper_height = float("nan")
+    assert resolve_paper_mm(layout) == (420.0, 297.0)
+
+
+def test_cli_logs_traceback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    caplog.set_level("ERROR")
+    code = main(
+        ["export", str(tmp_path / "afwezig.dxf"), "--format", "pdf", "--output", str(tmp_path)]
+    )
+    assert code == 1
+    assert "Traceback" in caplog.text
+    assert "niet gevonden" in caplog.text
 
 
 def test_missing_and_invalid_files(tmp_path: Path) -> None:
